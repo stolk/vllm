@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 
+import os
 import torch
 from torch import nn
 
@@ -109,10 +110,14 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         original_quant = vllm_config.quant_config
         if quant_config and quant_config.get_name() not in ("modelopt_fp4",):
             hf_qc = getattr(model_config.hf_config, "quantization_config", None)
-            if isinstance(hf_qc, dict):
+            if os.environ.get("B70_MTP_BF16_DRAFT") == "1":
+                print("[B70] MTP draft: forcing unquantized build (env B70_MTP_BF16_DRAFT=1)")
+                vllm_config.quant_config = None
+            elif isinstance(hf_qc, dict):
                 dynamic = hf_qc.get("dynamic", {})
                 if any(k.startswith("-:") and "mtp" in k for k in dynamic):
                     vllm_config.quant_config = None
+        # B70_MTP_NIGHTLY_DRAFT
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 vllm_config,
@@ -243,6 +248,10 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            # mark the draft head so the INT4 draft-lm_head hook can
+            # distinguish it from the target head (_vllm_prefix is not
+            # populated at process_weights_after_loading time in this build).
+            self.lm_head._hx_is_draft_head = True
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:

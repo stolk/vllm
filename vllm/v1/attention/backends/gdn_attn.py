@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -292,29 +293,47 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_decode_tokens = 0
 
             if num_prefills == 0 and num_decodes == 0:
-                spec_token_size = min(
-                    num_spec_decodes * (self.num_spec + 1),
-                    query_start_loc_cpu[-1].item(),
-                )
-                spec_token_indx = torch.arange(
-                    spec_token_size,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
-                non_spec_token_indx = torch.empty(
-                    0, dtype=torch.int32, device=query_start_loc.device
-                )
-                # Filter by spec_sequence_masks to exclude padded sequences
-                spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
-                non_spec_state_indices_tensor = None
-                # Padded sequences are always at the back, so the first
-                # num_spec_decodes + 1 entries of query_start_loc already
-                # contain the correct cumulative token counts.
-                spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
-                non_spec_query_start_loc = None
-                non_spec_query_start_loc_cpu = None
+                expected_spec_token_size = num_spec_decodes * (self.num_spec + 1)
+                actual_spec_token_size = query_start_loc_cpu[-1].item()
+                if actual_spec_token_size < expected_spec_token_size:
+                    # B70_MTP_PARTIAL_FINAL_GROUP: The max-sequence boundary can
+                    # truncate the final speculative group. The XPU GDN kernel
+                    # requires complete groups, so process this final partial
+                    # group through the existing stateful non-spec prefill path.
+                    spec_sequence_masks = None
+                    spec_sequence_masks_cpu = None
+                    num_prefills = num_spec_decodes
+                    num_prefill_tokens = actual_spec_token_size
+                    num_spec_decodes = 0
+                    num_spec_decode_tokens = 0
+                    spec_token_indx = None
+                    non_spec_token_indx = None
+                    spec_state_indices_tensor = None
+                    non_spec_state_indices_tensor = block_table_tensor[:, 0]
+                    spec_query_start_loc = None
+                    non_spec_query_start_loc = query_start_loc
+                    non_spec_query_start_loc_cpu = query_start_loc_cpu
+                    num_accepted_tokens = None
+                else:
+                    spec_token_indx = torch.arange(
+                        expected_spec_token_size,
+                        dtype=torch.int32,
+                        device=query_start_loc.device,
+                    )
+                    non_spec_token_indx = torch.empty(
+                        0, dtype=torch.int32, device=query_start_loc.device
+                    )
+                    # Filter by spec_sequence_masks to exclude padded sequences
+                    spec_state_indices_tensor = block_table_tensor[
+                        spec_sequence_masks_cpu, : self.num_spec + 1
+                    ]
+                    non_spec_state_indices_tensor = None
+                    # Padded sequences are always at the back, so the first
+                    # num_spec_decodes + 1 entries of query_start_loc already
+                    # contain the correct cumulative token counts.
+                    spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+                    non_spec_query_start_loc = None
+                    non_spec_query_start_loc_cpu = None
             else:
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks,
@@ -363,8 +382,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     out=non_spec_query_start_loc_cpu[1:],
                 )
 
-            assert num_accepted_tokens is not None
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            if spec_sequence_masks_cpu is not None:
+                assert num_accepted_tokens is not None
+                num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -436,6 +456,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decode_tokens <= self.decode_cudagraph_max_bs
         ):
             assert spec_sequence_masks is not None
+            if os.environ.get("GDN_DEBUG_REFRESH", "0") == "1":
+                print("GDN_DEBUG_REFRESH fired spec=%d" % num_spec_decodes, flush=True)
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
                 spec_state_indices_tensor, non_blocking=True
             )
@@ -494,6 +516,30 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
+
+        import os as _os
+        if _os.environ.get("GDN_DEBUG_META"):
+            import torch as _t
+            _n = getattr(self, "_dbg_n", 0)
+            self._dbg_n = _n + 1
+            if _n < 12:
+                _si = spec_state_indices_tensor
+                _nsi = non_spec_state_indices_tensor
+                print(
+                    "GDN_DEBUG_META call=%d pre=%d dec=%d spec=%d spectok=%d "
+                    "full_cg=%s spec_idx=%s nonspec_idx=%s has_init=%s"
+                    % (
+                        _n, num_prefills, num_decodes, num_spec_decodes,
+                        num_spec_decode_tokens, self.use_full_cuda_graph,
+                        (_si.flatten()[:8].tolist()
+                         if isinstance(_si, _t.Tensor) else None),
+                        (_nsi.flatten()[:8].tolist()
+                         if isinstance(_nsi, _t.Tensor) else None),
+                        (has_initial_state.flatten()[:4].tolist()
+                         if isinstance(has_initial_state, _t.Tensor) else None),
+                    ),
+                    flush=True,
+                )
 
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,

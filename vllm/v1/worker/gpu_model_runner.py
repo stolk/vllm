@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -1629,6 +1630,18 @@ class GPUModelRunner(
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+
+        if os.environ.get("VLLM_XPU_VERIFY_TRACE", "0") == "1":
+            _acc = (output_token_ids != -1).sum(dim=1).cpu().tolist()
+            _row = output_token_ids.cpu().tolist()
+            _drafts = {}
+            for _rid, _tok in scheduler_output.scheduled_spec_decode_tokens.items():
+                _drafts[str(_rid)] = [int(x) for x in _tok]
+            print(
+                "[verify-trace] num_reqs=%d accepted=%s row=%s drafts=%s"
+                % (num_reqs, _acc, _row, _drafts),
+                flush=True,
+            )
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -3614,6 +3627,7 @@ class GPUModelRunner(
         dict[str, Any],
         ECConnectorOutput | None,
     ]:
+        self._xpu_t_fwd_start = time.perf_counter()
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -4559,6 +4573,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
+        self._xpu_t_fwd = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4705,6 +4720,7 @@ class GPUModelRunner(
                     sampler_output.sampled_token_ids
                 )
 
+        self._xpu_t_sample = time.perf_counter()
         self._draft_token_ids = None
         self._draft_probs = None
         self._draft_prob_req_ids = None
@@ -4833,6 +4849,22 @@ class GPUModelRunner(
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
+            )
+
+        if os.environ.get("VLLM_XPU_STEP_TIMING", "0") == "1":
+            _tb = time.perf_counter()
+            print(
+                "[xpu-step-timing] fwd=%.3fms samp=%.3fms book=%.3fms total=%.3fms"
+                " num_sched=%d spec_tokens=%d"
+                % (
+                    (self._xpu_t_fwd - self._xpu_t_fwd_start) * 1000,
+                    (self._xpu_t_sample - self._xpu_t_fwd) * 1000,
+                    (_tb - self._xpu_t_sample) * 1000,
+                    (_tb - self._xpu_t_fwd_start) * 1000,
+                    scheduler_output.total_num_scheduled_tokens,
+                    sum(len(v) for v in scheduler_output.scheduled_spec_decode_tokens.values()),
+                ),
+                flush=True,
             )
 
         if draft_after_bookkeeping:

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import os
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
@@ -11,6 +13,16 @@ from vllm.logger import init_logger
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+# Host-staged collectives for XPU TP on hosts where cross-device VRAM IPC is
+# unavailable (GPUs on separate PCIe root ports: zeMemOpenIpcHandle fails with
+# ZE_RESULT_ERROR_INVALID_ARGUMENT for cross-device handles). Payloads at or
+# above VLLM_XPU_HOST_STAGED_MIN_BYTES are bounced through pinned host memory
+# over the CPU (gloo) group; small payloads stay on the native device path.
+_HOST_STAGED = os.environ.get("VLLM_XPU_HOST_STAGED_COLLECTIVES", "0") == "1"
+_HOST_STAGED_MIN_BYTES = int(
+    os.environ.get("VLLM_XPU_HOST_STAGED_MIN_BYTES", str(1 * 1024 * 1024))
+)
 
 
 class XpuCommunicator(DeviceCommunicatorBase):
@@ -26,6 +38,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
             cpu_group, device, device_group, unique_name, use_all2all=use_all2all
         )
         self.ca_comm: None = None
+        self._init_host_staging()
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 from .all2all import AgRsAll2AllManager
@@ -45,8 +58,57 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
                 logger.info("Using AgRs manager on XPU device.")
 
+    def _init_host_staging(self):
+        self._staging_cache: dict = {}
+        if _HOST_STAGED:
+            logger.info(
+                "XpuCommunicator: host-staged collectives enabled "
+                "(threshold=%d bytes)",
+                _HOST_STAGED_MIN_BYTES,
+            )
+
+    def _needs_staging(self, t: torch.Tensor) -> bool:
+        return (
+            _HOST_STAGED
+            and t.numel() * t.element_size() >= _HOST_STAGED_MIN_BYTES
+        )
+
+    def _pinned(self, shape, dtype) -> torch.Tensor:
+        key = (tuple(shape), dtype)
+        buf = self._staging_cache.get(key)
+        if buf is None:
+            buf = torch.empty(shape, dtype=dtype, pin_memory=True)
+            self._staging_cache[key] = buf
+        return buf
+
+    def _staged_all_reduce(self, output: torch.Tensor) -> torch.Tensor:
+        buf = self._pinned(output.shape, output.dtype)
+        buf.copy_(output, non_blocking=False)
+        dist.all_reduce(buf, group=self.cpu_group)
+        output.copy_(buf, non_blocking=False)
+        return output
+
+    def _staged_all_gather(self, output: torch.Tensor,
+                           input_: torch.Tensor) -> None:
+        inbuf = self._pinned(input_.shape, input_.dtype)
+        inbuf.copy_(input_, non_blocking=False)
+        outbuf = self._pinned((self.world_size,) + tuple(inbuf.shape),
+                              input_.dtype)
+        dist.all_gather(list(outbuf.unbind(0)), inbuf, group=self.cpu_group)
+        output.copy_(outbuf.reshape(output.shape), non_blocking=False)
+
+    def _staged_reduce_scatter(self, output: torch.Tensor,
+                               input_: torch.Tensor) -> None:
+        inbuf = self._pinned(input_.shape, input_.dtype)
+        inbuf.copy_(input_, non_blocking=False)
+        outbuf = self._pinned(output.shape, output.dtype)
+        dist.reduce_scatter_tensor(outbuf, inbuf, group=self.cpu_group)
+        output.copy_(outbuf, non_blocking=False)
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         output = input_.clone()
+        if self._needs_staging(output):
+            return self._staged_all_reduce(output)
         dist.all_reduce(output, group=self.device_group)
         return output
 
@@ -69,7 +131,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
         )
 
-        dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
+        if self._needs_staging(input_tensor):
+            self._staged_reduce_scatter(output, input_tensor)
+        else:
+            dist.reduce_scatter_tensor(output, input_tensor,
+                                       group=self.device_group)
 
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
@@ -99,7 +165,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
         output = torch.empty(
             output_shape, dtype=input_tensor.dtype, device=input_tensor.device
         )
-        if sizes is not None and sizes.count(sizes[0]) != len(sizes):
+        if self._needs_staging(input_tensor):
+            self._staged_reduce_scatter(output, input_tensor)
+        elif sizes is not None and sizes.count(sizes[0]) != len(sizes):
             # if inputs shape in different ranks is not the same using reduce_scatter
             input_splits = list(input_tensor.split(sizes, dim=0))
             dist.reduce_scatter(output, input_splits, group=self.device_group)
@@ -138,7 +206,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 output_size, dtype=input_.dtype, device=input_.device
             )
 
-            if sizes is not None:
+            if self._needs_staging(input_):
+                self._staged_all_gather(output_tensor, input_)
+            elif sizes is not None:
                 all_gather_list = []
                 for size in sizes:
                     all_gather_list.append(
@@ -179,7 +249,11 @@ class XpuCommunicator(DeviceCommunicatorBase):
             (self.world_size,) + input_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        if self._needs_staging(input_):
+            self._staged_all_gather(output_tensor, input_)
+        else:
+            dist.all_gather_into_tensor(output_tensor, input_,
+                                        group=self.device_group)
         if self.rank_in_group == dst:
             # Reshape
             output_tensor = output_tensor.movedim(0, dim)
@@ -193,7 +267,15 @@ class XpuCommunicator(DeviceCommunicatorBase):
         return output_tensor
 
     def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
-        dist.broadcast(input_, src=src, group=self.device_group)
+        if self._needs_staging(input_):
+            buf = self._pinned(input_.shape, input_.dtype)
+            if self.rank_in_group == src:
+                buf.copy_(input_, non_blocking=False)
+            dist.broadcast(buf, src=src, group=self.cpu_group)
+            if self.rank_in_group != src:
+                input_.copy_(buf, non_blocking=False)
+        else:
+            dist.broadcast(input_, src=src, group=self.device_group)
 
     def dispatch_router_logits(
         self,
@@ -254,3 +336,108 @@ class XpuCommunicator(DeviceCommunicatorBase):
             hidden_states,
             is_sequence_parallel,
         )
+
+# --- Host-staged functional collectives -------------------------------------
+# The MTP proposer's hidden-state all-gather is traced by inductor and reaches
+# torch.distributed's python collectives directly, bypassing XpuCommunicator.
+# Wrap the python entry points so large XPU payloads are staged through pinned
+# host memory over the default group's CPU (gloo) backend. TP-only deployments
+# have TP group == WORLD, which is what the staged path uses.
+if _HOST_STAGED:
+    import torch.distributed.distributed_c10d as _c10d
+
+    _pg_world = None
+
+    def _stage_guard(t):
+        return (
+            isinstance(t, torch.Tensor)
+            and t.device.type == "xpu"
+            and t.numel() * t.element_size() >= _HOST_STAGED_MIN_BYTES
+        )
+
+    _cpu_group_cache = None
+
+    def _resolve_cpu_group(group):
+        # The device (xccl) group cannot carry CPU tensors; use the matching
+        # GroupCoordinator's gloo sibling instead.
+        global _cpu_group_cache
+        if _cpu_group_cache is not None:
+            return _cpu_group_cache
+        from vllm.distributed import get_tp_group, get_world_group
+        for gc in (get_tp_group(), get_world_group()):
+            dg = getattr(gc, "device_group", None)
+            if group is None or dg is None or group is dg:
+                _cpu_group_cache = gc.cpu_group
+                return _cpu_group_cache
+        _cpu_group_cache = get_world_group().cpu_group
+        return _cpu_group_cache
+
+    def _wrap_unary(name):
+        orig = getattr(_c10d, name)
+        def wrapped(tensor, *args, **kwargs):
+            if _stage_guard(tensor):
+                cpu = tensor.detach().to("cpu", copy=True)
+                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
+                orig(cpu, *args, **kwargs)
+                tensor.copy_(cpu, non_blocking=False)
+                return None
+            return orig(tensor, *args, **kwargs)
+        setattr(_c10d, name, wrapped)
+        setattr(dist, name, wrapped)
+
+    def _wrap_all_gather_into_tensor():
+        name = "all_gather_into_tensor"
+        orig = getattr(_c10d, name)
+        def wrapped(output, input_, *args, **kwargs):
+            if _stage_guard(input_) or _stage_guard(output):
+                cpu_in = input_.detach().to("cpu", copy=True)
+                cpu_out = torch.empty(
+                    (output.shape), dtype=output.dtype, pin_memory=True)
+                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
+                orig(cpu_out, cpu_in, *args, **kwargs)
+                output.copy_(cpu_out, non_blocking=False)
+                return None
+            return orig(output, input_, *args, **kwargs)
+        setattr(_c10d, name, wrapped)
+        setattr(dist, name, wrapped)
+
+    def _wrap_all_gather():
+        name = "all_gather"
+        orig = getattr(_c10d, name)
+        def wrapped(tensor_list, tensor, *args, **kwargs):
+            if _stage_guard(tensor):
+                cpu_in = tensor.detach().to("cpu", copy=True)
+                cpu_list = [
+                    torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+                    for t in tensor_list
+                ]
+                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
+                orig(cpu_list, cpu_in, *args, **kwargs)
+                for t, c in zip(tensor_list, cpu_list):
+                    t.copy_(c, non_blocking=False)
+                return None
+            return orig(tensor_list, tensor, *args, **kwargs)
+        setattr(_c10d, name, wrapped)
+        setattr(dist, name, wrapped)
+
+    def _wrap_reduce_scatter_tensor():
+        name = "reduce_scatter_tensor"
+        orig = getattr(_c10d, name)
+        def wrapped(output, input_, *args, **kwargs):
+            if _stage_guard(input_) or _stage_guard(output):
+                cpu_in = input_.detach().to("cpu", copy=True)
+                cpu_out = torch.empty(
+                    output.shape, dtype=output.dtype, pin_memory=True)
+                kwargs["group"] = _resolve_cpu_group(kwargs.pop("group", None))
+                orig(cpu_out, cpu_in, *args, **kwargs)
+                output.copy_(cpu_out, non_blocking=False)
+                return None
+            return orig(output, input_, *args, **kwargs)
+        setattr(_c10d, name, wrapped)
+        setattr(dist, name, wrapped)
+
+    _wrap_unary("all_reduce")
+    _wrap_all_gather()
+    _wrap_all_gather_into_tensor()
+    _wrap_reduce_scatter_tensor()
+    logger.info("host-staged functional collectives installed")

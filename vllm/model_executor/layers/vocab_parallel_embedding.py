@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -28,6 +29,9 @@ from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+from vllm.logger import init_logger as _init_logger
+
+_logger = _init_logger(__name__)
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 
@@ -63,6 +67,264 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+        self._maybe_prepare_xpu_int8_lm_head(layer)
+        self._maybe_prepare_xpu_int4_draft_lm_head(layer)
+
+    @staticmethod
+    def _env_enabled(name: str) -> bool:
+        return os.environ.get(name, "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def _maybe_prepare_xpu_int8_lm_head(self, layer: torch.nn.Module) -> None:
+        if not self._env_enabled("VLLM_XPU_LM_HEAD_INT8"):
+            return
+        if layer.__class__.__name__ != "ParallelLMHead":
+            return
+        scope = os.environ.get("VLLM_XPU_LM_HEAD_INT8_SCOPE", "all").strip().lower()
+        prefix = str(getattr(layer, "_vllm_prefix", ""))
+        prefix_parts = {part for part in prefix.replace("/", ".").split(".") if part}
+        # Qwen3Next target head is loaded as "language_model.lm_head"; the
+        # bundled MTP drafter remaps shared weights into a bare "lm_head".
+        # Other MTP models include an explicit "mtp" prefix segment.
+        is_mtp_head = ("mtp" in prefix_parts or prefix == "lm_head"
+                            or getattr(layer, "_hx_is_draft_head", False))
+        if is_mtp_head and self._env_enabled("VLLM_XPU_DRAFT_LM_HEAD_INT4"):
+            return
+        if scope in ("target", "target-only", "target_only") and is_mtp_head:
+            return
+        if scope in ("draft", "draft-only", "draft_only", "mtp") and not is_mtp_head:
+            return
+        if scope not in (
+            "all",
+            "target",
+            "target-only",
+            "target_only",
+            "draft",
+            "draft-only",
+            "draft_only",
+            "mtp",
+        ):
+            _logger.warning(
+                "Unknown VLLM_XPU_LM_HEAD_INT8_SCOPE=%r; using all lm_head layers.",
+                scope,
+            )
+        weight = getattr(layer, "weight", None)
+        if weight is None or weight.device.type != "xpu":
+            return
+        if weight.dtype not in (torch.float16, torch.bfloat16):
+            _logger.warning(
+                "VLLM_XPU_LM_HEAD_INT8 requested but lm_head weight dtype is %s; "
+                "falling back to the default BF16/FP16 path.",
+                weight.dtype,
+            )
+            return
+        try:
+            import vllm_xpu_kernels._xpu_C  # noqa: F401
+        except Exception as exc:
+            _logger.warning(
+                "VLLM_XPU_LM_HEAD_INT8 requested but vllm_xpu_kernels._xpu_C "
+                "could not be imported (%r); falling back to default lm_head.",
+                exc,
+            )
+            return
+        required_ops = ("int8_gemm_w8a8", "per_token_quant_int8_xpu")
+        if any(not hasattr(torch.ops._xpu_C, op) for op in required_ops):
+            _logger.warning(
+                "VLLM_XPU_LM_HEAD_INT8 requested but required _xpu_C ops are "
+                "unavailable; falling back to default lm_head.")
+            return
+
+        # Dense Qwen3.6 lm_head is BF16 even in the AutoRound INT4 checkpoint.
+        # This experimental path keeps the original weight intact and adds a
+        # transient per-output-channel INT8 copy. It is default-off and must pass
+        # the quality gate before being treated as a candidate result.
+        with torch.no_grad():
+            # chunk the row loop — a single float() shot is a
+            # 5 GB transient per head, which OOMs a single-card (TP1) load
+            # where the head is unsharded (2.54 GB full vocab per card).
+            num_rows, hidden = weight.shape
+            chunk = int(
+                os.environ.get("VLLM_XPU_LM_HEAD_INT8_CHUNK_ROWS", "4096")
+                or "4096")
+            scales = torch.empty(num_rows, dtype=torch.float32,
+                                 device=weight.device)
+            weight_q_t = torch.empty((hidden, num_rows), dtype=torch.int8,
+                                     device=weight.device)
+            for r0 in range(0, num_rows, chunk):
+                r1 = min(r0 + chunk, num_rows)
+                weight_f = weight[r0:r1].detach().float()
+                row_scales = (
+                    weight_f.abs().amax(dim=1).clamp_min(1.0e-10) / 127.0)
+                scales[r0:r1] = row_scales
+                weight_q_t[:, r0:r1] = (
+                    torch.round(weight_f / row_scales.view(-1, 1))
+                    .clamp(-127, 127)
+                    .to(torch.int8)
+                    .t()
+                )
+                del weight_f
+            weight_q_t = weight_q_t.contiguous()
+            scale_dtype = os.environ.get(
+                "VLLM_XPU_LM_HEAD_INT8_SCALE_DTYPE", "fp32"
+            ).strip().lower()
+            if scale_dtype in ("bf16", "bfloat16"):
+                scales = scales.to(torch.bfloat16)
+            elif scale_dtype in ("fp16", "float16", "half"):
+                scales = scales.to(torch.float16)
+            elif scale_dtype not in ("", "fp32", "float32"):
+                _logger.warning(
+                    "Unknown VLLM_XPU_LM_HEAD_INT8_SCALE_DTYPE=%r; using fp32.",
+                    scale_dtype,
+                )
+            scales = scales.contiguous()  # chunk-quantized above
+
+        for name, tensor in (("_xpu_lm_head_int8_weight_t", weight_q_t),
+                             ("_xpu_lm_head_int8_scale", scales)):
+            if name in layer._buffers:
+                layer._buffers[name] = tensor
+            else:
+                layer.register_buffer(name, tensor, persistent=False)
+        _logger.info(
+            "Prepared experimental XPU INT8 lm_head: prefix=%s scope=%s "
+            "weight_t=%s scale=%s scale_dtype=%s",
+            prefix or "<unknown>",
+            scope or "all",
+            tuple(weight_q_t.shape),
+            tuple(scales.shape),
+            scales.dtype,
+        )
+
+    def _maybe_prepare_xpu_int4_draft_lm_head(self, layer: torch.nn.Module) -> None:
+        if not self._env_enabled("VLLM_XPU_DRAFT_LM_HEAD_INT4"):
+            return
+        if layer.__class__.__name__ != "ParallelLMHead":
+            return
+        prefix = str(getattr(layer, "_vllm_prefix", ""))
+        prefix_parts = {part for part in prefix.replace("/", ".").split(".") if part}
+        # Qwen3Next MTP draft heads are either a bare "lm_head" after sharing or
+        # contain an "mtp" prefix segment. Keep the target lm_head exact.
+        is_mtp_head = (getattr(layer, "_hx_is_draft_head", False)
+                            or "mtp" in prefix_parts or prefix == "lm_head")
+        if not is_mtp_head:
+            return
+        weight = getattr(layer, "weight", None)
+        if weight is None or weight.device.type != "xpu":
+            return
+        if weight.dtype not in (torch.float16, torch.bfloat16):
+            _logger.warning(
+                "VLLM_XPU_DRAFT_LM_HEAD_INT4 requested but lm_head weight dtype "
+                "is %s; falling back to the default draft lm_head.",
+                weight.dtype,
+            )
+            return
+        try:
+            import vllm_xpu_kernels._xpu_C  # noqa: F401
+        except Exception as exc:
+            _logger.warning(
+                "VLLM_XPU_DRAFT_LM_HEAD_INT4 requested but "
+                "vllm_xpu_kernels._xpu_C could not be imported (%r); falling "
+                "back to default draft lm_head.",
+                exc,
+            )
+            return
+        if not hasattr(torch.ops._xpu_C, "int4_gemm_w4a16"):
+            _logger.warning(
+                "VLLM_XPU_DRAFT_LM_HEAD_INT4 requested but "
+                "_xpu_C.int4_gemm_w4a16 is unavailable; falling back.")
+            return
+
+        group_size = int(
+            os.environ.get("VLLM_XPU_DRAFT_LM_HEAD_INT4_GROUP_SIZE", "128")
+            or "128")
+        chunk_rows = int(
+            os.environ.get("VLLM_XPU_DRAFT_LM_HEAD_INT4_CHUNK_ROWS", "2048")
+            or "2048")
+        if group_size <= 0 or weight.shape[1] % group_size != 0:
+            raise ValueError(
+                "VLLM_XPU_DRAFT_LM_HEAD_INT4_GROUP_SIZE must divide hidden "
+                f"size {weight.shape[1]}, got {group_size}")
+        if group_size % 8 != 0:
+            raise ValueError(
+                "VLLM_XPU_DRAFT_LM_HEAD_INT4_GROUP_SIZE must be divisible by 8")
+
+        num_tokens, hidden = weight.shape
+        packed_k = hidden // 8
+        num_groups = hidden // group_size
+        chunk_rows = max(1, min(chunk_rows, num_tokens))
+        scale_dtype = os.environ.get(
+            "VLLM_XPU_DRAFT_LM_HEAD_INT4_SCALE_DTYPE", "bf16"
+        ).strip().lower()
+        if scale_dtype in ("fp16", "float16", "half"):
+            scale_torch_dtype = torch.float16
+        elif scale_dtype in ("fp32", "float32"):
+            scale_torch_dtype = torch.float32
+        else:
+            scale_torch_dtype = torch.bfloat16
+
+        with torch.no_grad():
+            # Store as [N, K/8] contiguous and pass the transposed view, matching
+            # oneDNN's int4 NT layout requirement (logical [K/8, N] with
+            # stride(0)==1). Values are unsigned nibbles with symmetric zp=8.
+            packed_storage = torch.empty(
+                (num_tokens, packed_k),
+                dtype=torch.int32,
+                device=weight.device,
+            )
+            scales = torch.empty(
+                (num_groups, num_tokens),
+                dtype=scale_torch_dtype,
+                device=weight.device,
+            )
+            factors = (
+                (16 ** torch.arange(8, device=weight.device, dtype=torch.int32))
+                .view(1, 1, 8)
+            )
+            for start in range(0, num_tokens, chunk_rows):
+                end = min(start + chunk_rows, num_tokens)
+                w = weight[start:end].detach().float()
+                w_grouped = w.view(end - start, num_groups, group_size)
+                chunk_scales = (
+                    w_grouped.abs().amax(dim=2).clamp_min(1.0e-10) / 7.0
+                )
+                scales[:, start:end] = chunk_scales.t().to(scale_torch_dtype)
+                q = torch.round(
+                    w_grouped / chunk_scales.unsqueeze(-1)
+                ).clamp(-8, 7).to(torch.int32) + 8
+                packed = (
+                    (q.view(end - start, packed_k, 8) * factors)
+                    .sum(dim=2)
+                    .to(torch.int32)
+                )
+                packed_storage[start:end].copy_(packed)
+                del w, w_grouped, chunk_scales, q, packed
+
+            qweight = packed_storage.t()
+            qzeros = torch.tensor([8], dtype=torch.int8, device=weight.device)
+
+        for name, tensor in (
+            ("_xpu_lm_head_int4_weight_t", qweight),
+            ("_xpu_lm_head_int4_scale", scales.contiguous()),
+            ("_xpu_lm_head_int4_qzeros", qzeros),
+        ):
+            if name in layer._buffers:
+                layer._buffers[name] = tensor
+            else:
+                layer.register_buffer(name, tensor, persistent=False)
+        layer._xpu_lm_head_int4_group_size = group_size
+        _logger.info(
+            "Prepared experimental XPU INT4 draft lm_head: prefix=%s "
+            "weight_t=%s stride=%s scale=%s scale_dtype=%s group_size=%d",
+            prefix or "<unknown>",
+            tuple(qweight.shape),
+            tuple(qweight.stride()),
+            tuple(scales.shape),
+            scales.dtype,
+            group_size,
+        )
 
     def apply(
         self,
@@ -72,6 +334,72 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ) -> torch.Tensor:
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
+        if (
+            os.environ.get("VLLM_XPU_DRAFT_LM_HEAD_INT4", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+            and bias is None
+            and x.device.type == "xpu"
+            and hasattr(layer, "_xpu_lm_head_int4_weight_t")
+            and hasattr(layer, "_xpu_lm_head_int4_scale")
+            and hasattr(layer, "_xpu_lm_head_int4_qzeros")
+        ):
+            # draft lm_head as RTN INT4 g128
+            # through oneDNN int4_gemm_w4a16. Draft logits only steer token
+            # proposals; the FP16/INT8 target head still verifies.
+            x_contiguous = x if x.is_contiguous() else x.contiguous()
+            out_shape = x_contiguous.shape[:-1] + (
+                layer._xpu_lm_head_int4_weight_t.shape[1],
+            )
+            logits = torch.ops._xpu_C.int4_gemm_w4a16(
+                x_contiguous.reshape(-1, x_contiguous.shape[-1]),
+                layer._xpu_lm_head_int4_weight_t,
+                None,
+                layer._xpu_lm_head_int4_scale,
+                layer._xpu_lm_head_int4_qzeros,
+                layer._xpu_lm_head_int4_group_size,
+                None,
+            )
+            fallback_margin_s = os.environ.get(
+                "VLLM_XPU_DRAFT_LM_HEAD_INT4_FALLBACK_MARGIN", "0")
+            try:
+                fallback_margin = float(fallback_margin_s or "0")
+            except ValueError:
+                fallback_margin = 0.0
+            if fallback_margin > 0.0 and logits.shape[-1] >= 2:
+                top2 = torch.topk(logits.float(), k=2, dim=-1).values
+                low_margin = (top2[:, 0] - top2[:, 1]) < fallback_margin
+                if bool(low_margin.any().item()):
+                    flat_x = x_contiguous.reshape(
+                        -1, x_contiguous.shape[-1])
+                    exact_logits = F.linear(
+                        flat_x[low_margin].to(layer.weight.dtype),
+                        layer.weight,
+                        bias,
+                    )
+                    logits[low_margin] = exact_logits.to(logits.dtype)
+            return logits.reshape(out_shape)
+        if (
+            os.environ.get("VLLM_XPU_LM_HEAD_INT8", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+            and bias is None
+            and x.device.type == "xpu"
+            and hasattr(layer, "_xpu_lm_head_int8_weight_t")
+            and hasattr(layer, "_xpu_lm_head_int8_scale")
+        ):
+            # W8A8 INT8 lm_head: the 2.54 GB
+            # FP16 vocab GEMM is read on every draft step and every verify;
+            # INT8 halves the single biggest per-step weight read.
+            x_contiguous = x if x.is_contiguous() else x.contiguous()
+            x_q, x_scale = torch.ops._xpu_C.per_token_quant_int8_xpu(
+                x_contiguous)
+            return torch.ops._xpu_C.int8_gemm_w8a8(
+                x_q,
+                x_scale,
+                layer._xpu_lm_head_int8_weight_t,
+                layer._xpu_lm_head_int8_scale,
+                layer.weight.dtype,
+                None,
+            )
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

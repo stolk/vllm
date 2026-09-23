@@ -25,6 +25,14 @@ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
 logger = init_logger(__name__)
 
+def _to_s64(addr: int) -> int:
+    """Reinterpret a 64-bit device address as signed int64 for torch int64
+    buffers. XPU VMM addresses can exceed 2**63-1; the triton consumers load
+    the raw 64-bit pattern, so two's-complement storage is bit-exact."""
+    return addr if addr < (1 << 63) else addr - (1 << 64)
+
+
+
 # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
 # microbenchmarks
 _TEMPORAL_TILES = 16
@@ -764,7 +772,7 @@ class MambaSpecDecodeGPUContext:
 
                 for state_type_idx, state in enumerate(kv_caches):
                     # Base address
-                    self.state_base_addrs[idx] = state.data_ptr()
+                    self.state_base_addrs[idx] = _to_s64(state.data_ptr())
 
                     # Block stride (bytes between consecutive blocks)
                     # state shape: [num_blocks, ...], stride(0) = elements per block
@@ -852,7 +860,7 @@ class MambaSpecDecodeGPUContext:
         )
         self.block_table_stride_req = int(next(iter(strides)))
         for i, bt in enumerate(block_tables):
-            self.block_table_ptrs[i] = bt.data_ptr()
+            self.block_table_ptrs[i] = _to_s64(bt.data_ptr())
 
         self.is_initialized = True
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -27,6 +28,108 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
+
+_GRAPH_DUMP = os.environ.get("VLLM_XPU_GRAPH_DUMP", "0") == "1"
+_GRAPH_DUMP_DIR = os.environ.get("VLLM_XPU_GRAPH_DUMP_PATH", "/tmp/gdump")
+_GRAPH_DUMP_INST = [0]
+_GRAPH_DUMP_SEQ = [0]
+_GRAPH_DUMP_SEEN = set()
+
+
+def _dump_replay(inst_id, entry, args, kwargs, runnable, output_after):
+    if not _GRAPH_DUMP:
+        return
+    num_tokens = entry.batch_descriptor.num_tokens
+    key = (inst_id, num_tokens)
+    if key in _GRAPH_DUMP_SEEN:
+        return
+    _GRAPH_DUMP_SEEN.add(key)
+    _GRAPH_DUMP_SEQ[0] += 1
+    seq = _GRAPH_DUMP_SEQ[0]
+    os.makedirs(_GRAPH_DUMP_DIR, exist_ok=True)
+
+    def summarize(x):
+        if isinstance(x, torch.Tensor):
+            small = x.numel() <= 5120 * 16
+            return {
+                "kind": "tensor",
+                "shape": list(x.shape),
+                "dtype": str(x.dtype),
+                "full": x.detach().float().cpu() if small else None,
+                "mean": float(x.detach().float().mean()) if not small else None,
+                "std": float(x.detach().float().std()) if not small else None,
+                "absmax": float(x.detach().float().abs().max()) if not small else None,
+                "first8": x.detach().flatten()[:8].float().cpu().tolist() if not small else None,
+            }
+        if isinstance(x, (list, tuple)):
+            return [summarize(v) for v in x]
+        if isinstance(x, dict):
+            return {k: summarize(v) for k, v in x.items()}
+        return {"kind": type(x).__name__, "val": str(x)}
+
+    # Compute eager reference for the same inputs to detect graph-replay bugs.
+    eager_output = None
+    try:
+        with torch.no_grad():
+            eager_output = runnable(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        eager_output = {"error": str(e)}
+
+    payload = {
+        "seq": seq,
+        "inst": inst_id,
+        "num_tokens": num_tokens,
+        "args": summarize(args),
+        "kwargs": summarize(kwargs),
+        "output": summarize(output_after),
+        "eager_output": summarize(eager_output),
+    }
+    path = os.path.join(_GRAPH_DUMP_DIR, f"r{seq:05d}_inst{inst_id}_b{num_tokens}.pt")
+    torch.save(payload, path)
+    print(f"GRAPH_DUMP seq={seq} inst={inst_id} b={num_tokens} -> {path}", flush=True)
+
+
+def _dump_capture(inst_id, entry, args, kwargs, output, runnable):
+    num_tokens = entry.batch_descriptor.num_tokens
+    os.makedirs(_GRAPH_DUMP_DIR, exist_ok=True)
+
+    def summarize(x):
+        if isinstance(x, torch.Tensor):
+            small = x.numel() <= 5120 * 16
+            return {
+                "kind": "tensor",
+                "shape": list(x.shape),
+                "dtype": str(x.dtype),
+                "full": x.detach().float().cpu() if small else None,
+                "mean": float(x.detach().float().mean()) if not small else None,
+                "std": float(x.detach().float().std()) if not small else None,
+                "absmax": float(x.detach().float().abs().max()) if not small else None,
+            }
+        if isinstance(x, (list, tuple)):
+            return [summarize(v) for v in x]
+        if isinstance(x, dict):
+            return {k: summarize(v) for k, v in x.items()}
+        return {"kind": type(x).__name__, "val": str(x)}
+
+    # Re-run eagerly (outside capture) to get the reference output for the
+    # capture-time inputs.
+    eager = None
+    try:
+        with torch.no_grad():
+            eager = runnable(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        eager = {"error": str(e)}
+
+    payload = {
+        "inst": inst_id,
+        "num_tokens": num_tokens,
+        "args": summarize(args),
+        "capture_output": summarize(output),
+        "eager_output": summarize(eager),
+    }
+    path = os.path.join(_GRAPH_DUMP_DIR, f"c{inst_id}_b{num_tokens}.pt")
+    torch.save(payload, path)
+    print(f"GRAPH_DUMP_CAPTURE inst={inst_id} b={num_tokens} -> {path}", flush=True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,7 +242,7 @@ class CUDAGraphEntry:
 class CUDAGraphOptions:
     debug_log_enable: bool = True
     gc_disable: bool = False
-    weak_ref_output: bool = True
+    weak_ref_output: bool = False
 
 
 class CUDAGraphWrapper:
@@ -197,7 +300,12 @@ class CUDAGraphWrapper:
         # TODO: in the future, if we want to use multiple
         # streams, it might not be safe to share a global pool.
         # only investigate this when we use multiple streams
-        self.graph_pool = current_platform.get_global_graph_pool()
+        # (experiment): separate-pool. XPU graph-pool sharing across
+        # pieces corrupts batched replay; give each graph its own pool.
+        if os.environ.get("VLLM_XPU_SEPARATE_GRAPH_POOLS", "0") == "1":
+            self.graph_pool = None
+        else:
+            self.graph_pool = current_platform.get_global_graph_pool()
 
         if cudagraph_options is None:
             cudagraph_options = CUDAGraphOptions()
@@ -205,6 +313,8 @@ class CUDAGraphWrapper:
         # the entries for different batch descriptors that we need to capture
         # cudagraphs for.
         self.concrete_cudagraph_entries: dict[BatchDescriptor, CUDAGraphEntry] = {}
+        self._dump_inst_id = _GRAPH_DUMP_INST[0]
+        _GRAPH_DUMP_INST[0] += 1
 
         CUDAGraphWrapper._all_instances.add(self)
 
@@ -336,6 +446,9 @@ class CUDAGraphWrapper:
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
 
+            if _GRAPH_DUMP:
+                _dump_capture(self._dump_inst_id, entry, args, kwargs, output, self.runnable)
+
             compilation_counter.num_cudagraph_captured += 1
 
             # important: we need to return the output, rather than
@@ -358,4 +471,5 @@ class CUDAGraphWrapper:
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
         entry.cudagraph.replay()
+        _dump_replay(self._dump_inst_id, entry, args, kwargs, self.runnable, entry.output)
         return entry.output

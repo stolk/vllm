@@ -23,6 +23,100 @@ _HOST_STAGED = os.environ.get("VLLM_XPU_HOST_STAGED_COLLECTIVES", "0") == "1"
 _HOST_STAGED_MIN_BYTES = int(
     os.environ.get("VLLM_XPU_HOST_STAGED_MIN_BYTES", str(1 * 1024 * 1024))
 )
+# Move the staged all-reduce's data through /dev/shm instead of gloo. gloo's
+# transport manages ~0.6 GB/s even between processes on one host, so a
+# prefill-sized all-reduce (8192 x 5120 fp16 = 80 MiB) took ~140 ms, capping
+# TP=2 prefill near 450 tok/s. Through shared memory the same all-reduce is
+# ~32 ms (measured on 2x Arc Pro B70); gloo then only carries a 1-element
+# barrier. Requires every rank of the group on one host; falls back otherwise.
+_HOST_STAGED_SHM = os.environ.get("VLLM_XPU_HOST_STAGED_SHM", "0") == "1"
+
+
+class _ShmAllReduce:
+    """All-reduce through per-rank /dev/shm segments, summed on the device.
+
+    Each rank copies its tensor into its own segment, all ranks meet at a
+    barrier, then each rank copies every peer segment to its device and sums
+    all contributions in rank order, so every rank gets identical bits.
+
+    Segments are double-buffered: call n+2 reuses call n's slot, and no rank
+    can pass call n+1's barrier until every rank has finished reading call n,
+    so one barrier per call is enough.
+    """
+
+    def __init__(self, cpu_group: ProcessGroup, rank: int, world_size: int):
+        import mmap
+        import socket
+
+        self._mmap = mmap
+        self.cpu_group = cpu_group
+        self.rank = rank
+        self.world_size = world_size
+        hosts: list = [None] * world_size
+        dist.all_gather_object(hosts, socket.gethostname(), group=cpu_group)
+        self.usable = len(set(hosts)) == 1
+        tag = [f"{os.getpid()}_{id(self)}" if rank == 0 else None]
+        dist.broadcast_object_list(
+            tag, src=dist.get_global_rank(cpu_group, 0), group=cpu_group
+        )
+        self.tag = tag[0]
+        self.capacity = 0
+        self.generation = 0
+        self.maps: list = []  # [slot][rank] -> mmap
+        self.calls = 0
+
+    def _allocate(self, nbytes: int) -> None:
+        # Collective: every rank reaches this with the same nbytes, since
+        # all-reduce operands have the same shape on every rank.
+        for slot in self.maps:
+            for m in slot:
+                m.close()
+        self.generation += 1
+        cap = max(nbytes, 2 * self.capacity, 1 << 20)
+        paths = [
+            [f"/dev/shm/vllm_xpu_ar_{self.tag}_g{self.generation}_s{s}_r{r}"
+             for r in range(self.world_size)]
+            for s in range(2)
+        ]
+        for s in range(2):
+            fd = os.open(paths[s][self.rank], os.O_CREAT | os.O_RDWR, 0o600)
+            os.ftruncate(fd, cap)
+            os.close(fd)
+        dist.barrier(group=self.cpu_group)
+        self.maps = []
+        for s in range(2):
+            row = []
+            for r in range(self.world_size):
+                fd = os.open(paths[s][r], os.O_RDWR)
+                row.append(self._mmap.mmap(fd, cap))
+                os.close(fd)
+            self.maps.append(row)
+        dist.barrier(group=self.cpu_group)
+        # Everyone is attached: unlink now, so nothing leaks even on SIGKILL.
+        for s in range(2):
+            os.unlink(paths[s][self.rank])
+        self.capacity = cap
+
+    def all_reduce(self, output: torch.Tensor) -> torch.Tensor:
+        nbytes = output.numel() * output.element_size()
+        if nbytes > self.capacity:
+            self._allocate(nbytes)
+        slot = self.maps[self.calls & 1]
+        self.calls += 1
+        views = [
+            torch.frombuffer(m, dtype=output.dtype, count=output.numel()).view(
+                output.shape
+            )
+            for m in slot
+        ]
+        views[self.rank].copy_(output)
+        dist.barrier(group=self.cpu_group)
+        acc = None
+        for r in range(self.world_size):
+            part = output if r == self.rank else views[r].to(output.device)
+            acc = part.clone() if acc is None else acc.add_(part)
+        output.copy_(acc)
+        return output
 
 
 class XpuCommunicator(DeviceCommunicatorBase):
@@ -60,11 +154,13 @@ class XpuCommunicator(DeviceCommunicatorBase):
 
     def _init_host_staging(self):
         self._staging_cache: dict = {}
+        self._shm_ar: _ShmAllReduce | None = None
         if _HOST_STAGED:
             logger.info(
                 "XpuCommunicator: host-staged collectives enabled "
-                "(threshold=%d bytes)",
+                "(threshold=%d bytes, shm all-reduce=%s)",
                 _HOST_STAGED_MIN_BYTES,
+                _HOST_STAGED_SHM,
             )
 
     def _needs_staging(self, t: torch.Tensor) -> bool:
@@ -82,6 +178,20 @@ class XpuCommunicator(DeviceCommunicatorBase):
         return buf
 
     def _staged_all_reduce(self, output: torch.Tensor) -> torch.Tensor:
+        if _HOST_STAGED_SHM and self.world_size > 1:
+            # Created lazily on the first staged all-reduce, which every rank
+            # of the group reaches together.
+            if self._shm_ar is None:
+                self._shm_ar = _ShmAllReduce(
+                    self.cpu_group, self.rank_in_group, self.world_size
+                )
+                logger.info(
+                    "XpuCommunicator: shm all-reduce %s",
+                    "active" if self._shm_ar.usable
+                    else "unavailable (ranks on several hosts), using gloo",
+                )
+            if self._shm_ar.usable:
+                return self._shm_ar.all_reduce(output)
         buf = self._pinned(output.shape, output.dtype)
         buf.copy_(output, non_blocking=False)
         dist.all_reduce(buf, group=self.cpu_group)

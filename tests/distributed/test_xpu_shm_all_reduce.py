@@ -144,7 +144,11 @@ def _worker_no_leak(rank, world_size):
         ar.all_reduce(torch.ones(shape))
         dist.barrier()
         # Segments are unlinked once every rank has mapped them.
-        assert _shm_segments(ar.tag) == [], _shm_segments(ar.tag)
+        segs = _shm_segments(ar.tag)
+        # The next shape grows the buffer: a rank that moves on creates the
+        # next generation's segments, which a slower rank would still list.
+        dist.barrier()
+        assert segs == [], segs
 
 
 def test_segments_are_unlinked_after_attach():

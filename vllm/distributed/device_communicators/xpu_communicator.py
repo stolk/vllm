@@ -15,9 +15,10 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
 
-# Host-staged collectives for XPU TP on hosts where cross-device VRAM IPC is
-# unavailable (GPUs on separate PCIe root ports: zeMemOpenIpcHandle fails with
-# ZE_RESULT_ERROR_INVALID_ARGUMENT for cross-device handles). Payloads at or
+# Host-staged collectives for XPU TP on hosts where oneCCL's device path is
+# unusable: without PCIe peer atomics its kernels hang, and on some boards
+# zeMemOpenIpcHandle fails with ZE_RESULT_ERROR_INVALID_ARGUMENT for
+# cross-device handles. Payloads at or
 # above VLLM_XPU_HOST_STAGED_MIN_BYTES are bounced through pinned host memory
 # over the CPU (gloo) group; small payloads stay on the native device path.
 _HOST_STAGED = os.environ.get("VLLM_XPU_HOST_STAGED_COLLECTIVES", "0") == "1"
@@ -31,6 +32,13 @@ _HOST_STAGED_MIN_BYTES = int(
 # ~32 ms (measured on 2x Arc Pro B70); gloo then only carries a 1-element
 # barrier. Requires every rank of the group on one host; falls back otherwise.
 _HOST_STAGED_SHM = os.environ.get("VLLM_XPU_HOST_STAGED_SHM", "0") == "1"
+# Do the staged all-reduce GPU to GPU instead: each rank writes its tensor
+# into the peers' device memory (Level Zero IPC, xpu_peer extension) and sums
+# locally. Plain peer writes need no peer atomics and run near link speed:
+# 80 MiB in ~9.6 ms vs ~28 ms through /dev/shm on 2x Arc Pro B70 (PCIe
+# gen3). Falls back to the shm/gloo path, on every rank together, if the
+# extension or the peer mapping is unusable.
+_PEER_ALLREDUCE = os.environ.get("VLLM_XPU_PEER_ALLREDUCE", "0") == "1"
 
 
 class _ShmAllReduce:
@@ -169,13 +177,52 @@ class XpuCommunicator(DeviceCommunicatorBase):
     def _init_host_staging(self):
         self._staging_cache: dict = {}
         self._shm_ar: _ShmAllReduce | None = None
+        self._peer_ar = None
+        self._peer_ar_failed = False
         if _HOST_STAGED:
             logger.info(
                 "XpuCommunicator: host-staged collectives enabled "
-                "(threshold=%d bytes, shm all-reduce=%s)",
+                "(threshold=%d bytes, shm all-reduce=%s, peer all-reduce=%s)",
                 _HOST_STAGED_MIN_BYTES,
                 _HOST_STAGED_SHM,
+                _PEER_ALLREDUCE,
             )
+
+    def _peer_all_reduce(self, output: torch.Tensor) -> torch.Tensor | None:
+        """All-reduce through peer device memory; None if unavailable, in
+        which case every rank of the group gets None from the same call."""
+        if self._peer_ar_failed:
+            return None
+        if self._peer_ar is None:
+            # Created lazily on the first staged all-reduce, which every
+            # rank of the group reaches together.
+            try:
+                from xpu_peer import PeerAllReduce
+                error = None
+            except ImportError as e:
+                error = str(e)
+            errors: list = [None] * self.world_size
+            dist.all_gather_object(errors, error, group=self.cpu_group)
+            if any(errors):
+                self._peer_ar_failed = True
+                logger.warning("XpuCommunicator: peer all-reduce unavailable "
+                               "(xpu_peer: %s)", next(e for e in errors if e))
+                return None
+            self._peer_ar = PeerAllReduce(
+                self.cpu_group, self.rank_in_group, self.world_size)
+        try:
+            out = self._peer_ar.all_reduce(output)
+        except RuntimeError as e:
+            # Raised on every rank from the same setup step, before any data
+            # moved; output is untouched.
+            logger.warning("XpuCommunicator: peer all-reduce disabled: %s", e)
+            self._peer_ar.close()
+            self._peer_ar = None
+            self._peer_ar_failed = True
+            return None
+        if self._peer_ar.calls == 1:
+            logger.info("XpuCommunicator: peer all-reduce active")
+        return out
 
     def _needs_staging(self, t: torch.Tensor) -> bool:
         return (
@@ -192,6 +239,10 @@ class XpuCommunicator(DeviceCommunicatorBase):
         return buf
 
     def _staged_all_reduce(self, output: torch.Tensor) -> torch.Tensor:
+        if _PEER_ALLREDUCE and self.world_size > 1 and output.is_contiguous():
+            out = self._peer_all_reduce(output)
+            if out is not None:
+                return out
         if _HOST_STAGED_SHM and self.world_size > 1:
             # Created lazily on the first staged all-reduce, which every rank
             # of the group reaches together.
